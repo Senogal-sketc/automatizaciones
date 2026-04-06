@@ -17,18 +17,18 @@ on:
         required: false
         default: "3"
 
-env:
-  # Los JSONs se guardan aquí dentro del runner (efímero)
-  BASE_DATA_DIR: ${{ github.workspace }}/data
-  # Rutas a los archivos de credenciales de Gmail
-  GMAIL_CREDENTIALS: ${{ github.workspace }}/credentials.json
-  GMAIL_TOKEN:       ${{ github.workspace }}/token.json
-
 jobs:
   scrape-and-report:
     name: Scraping + Reporte por correo
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
+    env:
+      # Los JSONs se guardan aquí dentro del runner (efímero)
+      BASE_DATA_DIR: ${{ github.workspace }}/data
+      # Rutas a los archivos de credenciales de Gmail
+      GMAIL_CREDENTIALS: ${{ github.workspace }}/credentials.json
+      GMAIL_TOKEN:       ${{ github.workspace }}/token.json
 
     steps:
       # ── 1. Checkout ─────────────────────────────────────────────────
