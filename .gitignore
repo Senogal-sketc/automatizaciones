@@ -1,0 +1,11 @@
+credentials.json
+token.json
+*.pyc
+__pycache__/
+logs/
+data/
+.env
+
+# Notebooks de desarrollo (tienen API keys hardcodeadas)
+Scraping_Noticias/Scraping_JpyLab/
+Scraping_Noticias/Email/
