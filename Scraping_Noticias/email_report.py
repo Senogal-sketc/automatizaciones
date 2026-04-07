@@ -43,10 +43,10 @@ TZ = ZoneInfo("America/Lima")
 _DEFAULT_DESTINATARIOS = [
     "egaray@grupomacro.pe",
     "evander.garay@gmail.com",
-    # "ddiaz@grupomacro.pe",
-    # "varce@grupomacro.pe",
-    # "gtamayo@grupomacro.pe",
-    # "vflores@grupomacro.pe",
+    "ddiaz@grupomacro.pe",
+    "varce@grupomacro.pe",
+    "gtamayo@grupomacro.pe",
+    "vflores@grupomacro.pe",
 ]
 
 GMAIL_SCOPES      = ["https://www.googleapis.com/auth/gmail.send"]
