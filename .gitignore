@@ -1,5 +1,9 @@
+# Datos IEOD descargados y generados (no van al repo)
+Stads/IEOD/
+
 credentials.json
 token.json
+Stads/config.py
 *.pyc
 __pycache__/
 logs/

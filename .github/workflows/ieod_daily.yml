@@ -1,0 +1,73 @@
+name: IEOD – Pipeline diario
+
+on:
+  # Todos los días a las 12:00 PM hora Lima (UTC-5 = 17:00 UTC)
+  schedule:
+    - cron: "0 17 * * *"
+
+  # Disparo manual desde la pestaña Actions (útil para fechas específicas)
+  workflow_dispatch:
+    inputs:
+      fecha:
+        description: "Fecha a procesar (YYYY-MM-DD). Vacío = ayer."
+        required: false
+        default: ""
+
+jobs:
+  pipeline-ieod:
+    name: Descarga, extracción y carga a PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: Stads/requirements.txt
+
+      - name: Instalar dependencias
+        run: pip install -r Stads/requirements.txt
+
+      # ── 3. Ejecutar pipeline ─────────────────────────────────────────────
+      #
+      # Secrets requeridos (Settings → Secrets and variables → Actions):
+      #   PG_HOST      → host de tu instancia PostgreSQL (ej: db.example.com)
+      #   PG_PORT      → puerto (normalmente 5432)
+      #   PG_DB        → nombre de la base de datos
+      #   PG_USER      → usuario
+      #   PG_PASSWORD  → contraseña
+      #   IEOD_BASE_DIR → ruta raíz donde guardar los Excels y JSON
+      #                   (ej: /tmp/ieod — se crea automáticamente en el runner)
+      #
+      - name: Ejecutar pipeline.py
+        env:
+          PG_HOST:      ${{ secrets.PG_HOST }}
+          PG_PORT:      ${{ secrets.PG_PORT }}
+          PG_DB:        ${{ secrets.PG_DB }}
+          PG_USER:      ${{ secrets.PG_USER }}
+          PG_PASSWORD:  ${{ secrets.PG_PASSWORD }}
+          IEOD_BASE_DIR: ${{ secrets.IEOD_BASE_DIR }}
+        working-directory: Stads
+        run: |
+          FECHA="${{ github.event.inputs.fecha }}"
+          if [ -z "$FECHA" ]; then
+            python pipeline.py
+          else
+            python pipeline.py --fecha "$FECHA"
+          fi
+
+      # ── 4. Guardar JSON como artefacto (30 días) ─────────────────────────
+      - name: Subir JSON del día como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ieod-json-${{ github.run_id }}
+          path: ${{ secrets.IEOD_BASE_DIR }}
+          retention-days: 30
