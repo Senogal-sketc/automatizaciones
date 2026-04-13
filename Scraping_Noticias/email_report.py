@@ -24,7 +24,7 @@ import os
 from datetime import datetime
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -71,6 +71,67 @@ OUTDIRS = {
 FIRMA = "Evander Garay"
 
 log = logging.getLogger("email_report")
+
+# Archivo donde se guardan los links ya enviados
+SENT_STATE_FILE = Path(__file__).parent / "sent_state.json"
+
+# ─────────────────────────────────────────────
+# ESTADO DE REGISTROS YA ENVIADOS
+# ─────────────────────────────────────────────
+
+def _load_sent_state() -> Dict[str, Set[str]]:
+    """Carga el conjunto de links ya enviados por fuente."""
+    if not SENT_STATE_FILE.exists():
+        return {k: set() for k in OUTDIRS}
+    try:
+        raw = json.loads(SENT_STATE_FILE.read_text(encoding="utf-8"))
+        return {k: set(v) for k, v in raw.items()}
+    except Exception as e:
+        log.warning("No se pudo leer sent_state.json, se asume vacío: %s", e)
+        return {k: set() for k in OUTDIRS}
+
+
+def _save_sent_state(state: Dict[str, Set[str]]) -> None:
+    """Persiste el estado (sets → listas para JSON)."""
+    SENT_STATE_FILE.write_text(
+        json.dumps({k: sorted(v) for k, v in state.items()},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    log.info("Estado de enviados guardado en %s", SENT_STATE_FILE)
+
+
+def _record_key(row: pd.Series, source: str) -> str:
+    """
+    Devuelve la clave única de un registro.
+    Usa 'link' si existe; si no, combina fuente + 'res' o 'titular'.
+    """
+    link = str(row.get("link", "")).strip()
+    if link and link not in ("nan", "None", ""):
+        return link
+    # Fallback para registros sin URL
+    for field in ("res", "titular", "sumilla"):
+        val = str(row.get(field, "")).strip()
+        if val and val not in ("nan", "None", ""):
+            return f"{source}::{val}"
+    return ""
+
+
+def _filter_new(df: pd.DataFrame, source: str, sent: Set[str]) -> pd.DataFrame:
+    """Retorna solo las filas cuya clave no está en 'sent'."""
+    if df.empty:
+        return df
+    mask = df.apply(lambda row: _record_key(row, source) not in sent, axis=1)
+    return df[mask].reset_index(drop=True)
+
+
+def _collect_keys(df: pd.DataFrame, source: str) -> Set[str]:
+    """Extrae todas las claves únicas de un DataFrame."""
+    if df.empty:
+        return set()
+    keys = df.apply(lambda row: _record_key(row, source), axis=1)
+    return {k for k in keys if k}
+
 
 # ─────────────────────────────────────────────
 # GMAIL AUTH
@@ -388,8 +449,26 @@ def build_and_send(destinatarios: Optional[List[str]] = None) -> None:
         len(df_elp), len(df_enm), len(df_osn), len(df_minem),
     )
 
-    html    = build_html(df_elp, df_enm, df_osn, df_minem, date_hoy)
-    asunto  = f"{date_asunto} | Resumen diario — Normas y Noticias Eléctricas"
+    # ── Filtrar solo registros nuevos (no enviados antes) ──
+    sent = _load_sent_state()
+
+    df_elp_new   = _filter_new(df_elp,   "el_peruano",  sent.get("el_peruano",  set()))
+    df_enm_new   = _filter_new(df_enm,   "energiminas", sent.get("energiminas", set()))
+    df_osn_new   = _filter_new(df_osn,   "osinergmin",  sent.get("osinergmin",  set()))
+    df_minem_new = _filter_new(df_minem, "minem",        sent.get("minem",       set()))
+
+    nuevos_total = len(df_elp_new) + len(df_enm_new) + len(df_osn_new) + len(df_minem_new)
+    log.info(
+        "Registros NUEVOS — El Peruano: %d | Energiminas: %d | Osinergmin: %d | MINEM: %d",
+        len(df_elp_new), len(df_enm_new), len(df_osn_new), len(df_minem_new),
+    )
+
+    if nuevos_total == 0:
+        log.info("Sin registros nuevos. No se enviará correo.")
+        return
+
+    html   = build_html(df_elp_new, df_enm_new, df_osn_new, df_minem_new, date_hoy)
+    asunto = f"{date_asunto} | Resumen diario — Normas y Noticias Eléctricas"
 
     if destinatarios is None:
         env_dest = os.getenv("DESTINATARIOS", "")
@@ -405,6 +484,13 @@ def build_and_send(destinatarios: Optional[List[str]] = None) -> None:
         _send_html(service, correo, asunto, html)
 
     log.info("✓ Reporte enviado a %d destinatario(s).", len(destinatarios))
+
+    # ── Actualizar estado con los registros recién enviados ──
+    sent.setdefault("el_peruano",  set()).update(_collect_keys(df_elp_new,   "el_peruano"))
+    sent.setdefault("energiminas", set()).update(_collect_keys(df_enm_new,   "energiminas"))
+    sent.setdefault("osinergmin",  set()).update(_collect_keys(df_osn_new,   "osinergmin"))
+    sent.setdefault("minem",       set()).update(_collect_keys(df_minem_new, "minem"))
+    _save_sent_state(sent)
 
 
 if __name__ == "__main__":

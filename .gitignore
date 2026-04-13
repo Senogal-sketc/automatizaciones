@@ -3,6 +3,7 @@ Stads/IEOD/
 
 credentials.json
 token.json
+sent_state.json
 Stads/config.py
 *.pyc
 __pycache__/
