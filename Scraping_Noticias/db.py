@@ -68,6 +68,9 @@ def _get_conn():
             "Configura la variable de entorno con la cadena de conexión de Supabase.\n"
             "La encuentras en: Supabase Dashboard → Settings → Database → Connection string (URI)"
         )
+    from urllib.parse import urlparse
+    _p = urlparse(DATABASE_URL)
+    log.info("DB connect → user=%s host=%s port=%s", _p.username, _p.hostname, _p.port)
     return psycopg2.connect(DATABASE_URL, connect_timeout=15)
 
 
