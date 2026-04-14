@@ -36,7 +36,9 @@ DATABASE_URL = os.getenv("SUPABASE_DB_URL", "")
 # ─────────────────────────────────────────────
 
 _CREATE_TABLE = """
-CREATE TABLE IF NOT EXISTS normas_noticias (
+CREATE SCHEMA IF NOT EXISTS normas_noticias;
+
+CREATE TABLE IF NOT EXISTS normas_noticias.normas_noticias (
     id             BIGSERIAL    PRIMARY KEY,
     fuente         TEXT         NOT NULL,
     link           TEXT         NOT NULL UNIQUE,
@@ -52,9 +54,9 @@ CREATE TABLE IF NOT EXISTS normas_noticias (
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_nn_fecha   ON normas_noticias (fecha_scraping);
-CREATE INDEX IF NOT EXISTS idx_nn_fuente  ON normas_noticias (fuente);
-CREATE INDEX IF NOT EXISTS idx_nn_created ON normas_noticias (created_at);
+CREATE INDEX IF NOT EXISTS idx_nn_fecha   ON normas_noticias.normas_noticias (fecha_scraping);
+CREATE INDEX IF NOT EXISTS idx_nn_fuente  ON normas_noticias.normas_noticias (fuente);
+CREATE INDEX IF NOT EXISTS idx_nn_created ON normas_noticias.normas_noticias (created_at);
 """
 
 # ─────────────────────────────────────────────
@@ -71,7 +73,8 @@ def _get_conn():
     from urllib.parse import urlparse
     _p = urlparse(DATABASE_URL)
     log.info("DB connect → user=%s host=%s port=%s", _p.username, _p.hostname, _p.port)
-    return psycopg2.connect(DATABASE_URL, connect_timeout=15)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=15,
+                            options="-c search_path=normas_noticias")
 
 
 # ─────────────────────────────────────────────
