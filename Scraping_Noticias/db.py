@@ -16,10 +16,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import psycopg2
 import psycopg2.extras
+from dotenv import load_dotenv
+
+# Carga automática del .env (si existe). No hace nada en GitHub Actions
+# donde las variables vienen como secrets del entorno.
+load_dotenv(Path(__file__).parent / ".env")
 
 log = logging.getLogger("db")
 
