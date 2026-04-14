@@ -24,9 +24,7 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # Los JSONs se guardan aquí dentro del runner (efímero)
-      BASE_DATA_DIR: ${{ github.workspace }}/data
-      # Rutas a los archivos de credenciales de Gmail
+      SUPABASE_DB_URL:   ${{ secrets.SUPABASE_DB_URL }}
       GMAIL_CREDENTIALS: ${{ github.workspace }}/credentials.json
       GMAIL_TOKEN:       ${{ github.workspace }}/token.json
 
@@ -84,15 +82,7 @@ jobs:
         run: python Scraping_Noticias/email_report.py
 
       # ── 6. Guardar JSONs como artefacto (30 días) ───────────────────
-      - name: Subir JSONs del día como artefacto
-        if: always()   # guardar incluso si hubo errores parciales
-        uses: actions/upload-artifact@v4
-        with:
-          name: data-${{ github.run_id }}
-          path: data/
-          retention-days: 30
-
-      # ── 7. Subir log del pipeline ────────────────────────────────────
+      # ── 6. Subir log del pipeline ────────────────────────────────────
       - name: Subir logs como artefacto
         if: always()
         uses: actions/upload-artifact@v4

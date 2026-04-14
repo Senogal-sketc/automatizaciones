@@ -30,6 +30,8 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
+import db as _db
+
 import requests
 from bs4 import BeautifulSoup
 from lxml import html as lxml_html
@@ -539,10 +541,14 @@ def _enm_parse_rss_date(date_str: str) -> str:
         return date_str[:10]
 
 
-def scrape_energiminas(target_count: int = 15, summarize: bool = True) -> List[dict]:
+def scrape_energiminas(target_count: int = 15) -> List[dict]:
+    """
+    Descarga hasta `target_count` artículos del RSS de Energiminas.
+    La deduplicación y el resumen con OpenAI se hacen en run_pipeline()
+    después de confirmar cuáles son realmente nuevos en la BD.
+    """
     log = logging.getLogger("pipeline.energiminas")
     RSS_BASE = "https://energiminas.com/category/electricidad/feed/"
-    OUTDIR_ENM = OUTDIRS["energiminas"]
 
     session = build_session("Energiminas")
     pages_needed = (target_count // 10) + 1
@@ -573,74 +579,56 @@ def scrape_energiminas(target_count: int = 15, summarize: bool = True) -> List[d
                     )
 
                 items.append({
-                    "fuente":        "Revista Energiminas",
-                    "link":          link,
-                    "titular":       titulo,
-                    "fecha_pub":     fecha_pub,
-                    "contenido":     contenido,
-                    "relevante":     _enm_is_relevant_kw(titulo, contenido),
-                    "resumen":       [],
-                    "nueva_noticia": 0,
+                    "fuente":    "Revista Energiminas",
+                    "link":      link,
+                    "titular":   titulo,
+                    "fecha_pub": fecha_pub,
+                    "contenido": contenido,
+                    "relevante": _enm_is_relevant_kw(titulo, contenido),
+                    "resumen":   [],
                 })
         except Exception as e:
             log.error("Error RSS página %d: %s", p, e)
 
     log.info("Energiminas: %d noticias extraídas", len(items))
-
-    # Detectar nuevas noticias vs. JSON de ayer
-    today_d    = datetime.now(LIMA_TZ).date()
-    ayer_d     = today_d - timedelta(days=1)
-    today_str  = today_d.strftime("%d/%m/%Y")
-    ayer_str   = ayer_d.strftime("%d/%m/%Y")
-    ayer_name  = ayer_d.strftime("%Y_%m_%d_Energiminas.json")
-    ayer_path  = OUTDIR_ENM / ayer_name
-
-    titulos_ayer: set = set()
-    if ayer_path.exists():
-        try:
-            with open(ayer_path, encoding="utf-8") as f:
-                data_ayer = json.load(f)
-            titulos_ayer = {clean_text(x.get("titular", "")).lower() for x in data_ayer}
-        except Exception as e:
-            log.warning("No se pudo leer JSON de ayer (%s): %s", ayer_path, e)
-
-    candidatas = [
-        it for it in items
-        if it["fecha_pub"] in (today_str, ayer_str)
-        and clean_text(it["titular"]).lower() not in titulos_ayer
-    ]
-    titulos_nuevas = {clean_text(it["titular"]).lower() for it in candidatas}
-    for it in items:
-        if clean_text(it["titular"]).lower() in titulos_nuevas:
-            it["nueva_noticia"] = 1
-
-    # Resumir + reclasificar con OpenAI
-    if summarize and candidatas:
-        if not OPENAI_API_KEY:
-            log.warning("OPENAI_API_KEY no definida — se omite resumen/relevancia con IA.")
-        else:
-            try:
-                client = _openai_client()
-                log.info("Resumiendo %d noticias nuevas con OpenAI…", len(candidatas))
-                for it in candidatas:
-                    bloque = (
-                        f"TITULAR: {it['titular']}\n"
-                        f"FECHA: {it['fecha_pub']}\n"
-                        f"LINK: {it['link']}\n\n"
-                        f"CONTENIDO:\n{it['contenido'][:9000]}"
-                    )
-                    try:
-                        res_json = _chat_json(client, _ENM_RESUMEN_SYS, bloque, max_tokens=300)
-                        it["resumen"] = [clean_text(str(x)) for x in res_json.get("resumen", [])][:5]
-                        rel_json = _chat_json(client, _ENM_RELEVANCIA_SYS, bloque, max_tokens=20)
-                        it["relevante"] = "1" if int(rel_json.get("relevante", 1)) == 1 else "0"
-                        time.sleep(0.3)
-                    except Exception as e:
-                        log.warning("Error procesando '%s': %s", it["titular"][:60], e)
-            except Exception as e:
-                log.warning("OpenAI no disponible para Energiminas: %s", e)
-
     return items
+
+
+def _enm_summarize_new(new_records: List[dict]) -> None:
+    """
+    Llama a OpenAI para resumir y reclasificar los artículos nuevos de Energiminas,
+    y actualiza la BD con los resultados.
+    """
+    log = logging.getLogger("pipeline.energiminas")
+    if not new_records:
+        return
+    if not OPENAI_API_KEY:
+        log.warning("OPENAI_API_KEY no definida — se omite resumen con OpenAI.")
+        return
+
+    try:
+        client = _openai_client()
+    except Exception as e:
+        log.warning("No se pudo crear cliente OpenAI: %s", e)
+        return
+
+    log.info("Resumiendo %d noticias nuevas con OpenAI…", len(new_records))
+    for it in new_records:
+        bloque = (
+            f"TITULAR: {it.get('titular','')}\n"
+            f"FECHA: {it.get('fecha_pub','')}\n"
+            f"LINK: {it.get('link','')}\n\n"
+            f"CONTENIDO:\n{str(it.get('contenido',''))[:9000]}"
+        )
+        try:
+            res_json = _chat_json(client, _ENM_RESUMEN_SYS, bloque, max_tokens=300)
+            resumen  = [clean_text(str(x)) for x in res_json.get("resumen", [])][:5]
+            rel_json = _chat_json(client, _ENM_RELEVANCIA_SYS, bloque, max_tokens=20)
+            relevante = "1" if int(rel_json.get("relevante", 1)) == 1 else "0"
+            _db.update_summary(it["link"], resumen, relevante)
+            time.sleep(0.3)
+        except Exception as e:
+            log.warning("Error procesando '%s': %s", it.get("titular","")[:60], e)
 
 
 # ─────────────────────────────────────────────
@@ -765,18 +753,30 @@ def run_pipeline(
     max_pages: int = 3,
 ) -> Dict[str, dict]:
     """
-    Ejecuta los scrapers indicados en orden y guarda los JSON.
+    Ejecuta los scrapers y persiste los resultados en Supabase (PostgreSQL).
+
+    Flujo por fuente:
+      1. Scraping  → lista de registros
+      2. Upsert BD → solo los nuevos (por link) se insertan
+      3. Energiminas: OpenAI sobre los nuevos → actualiza resumen/relevante en BD
 
     Returns:
         Diccionario con el resumen de ejecución por fuente:
         {
-          "osinergmin": {"status": "ok", "count": 75, "path": "..."},
+          "osinergmin": {"status": "ok", "scraped": 75, "new": 5},
           ...
         }
-        Útil para generar reportes / enviar por correo.
     """
     if fuentes is None:
         fuentes = list(SCRAPERS.keys())
+
+    # Asegurar que la tabla existe antes de empezar
+    try:
+        _db.ensure_tables()
+    except Exception as e:
+        logger.error("No se pudo conectar a Supabase: %s", e)
+        logger.error("Verifica que SUPABASE_DB_URL esté definida correctamente.")
+        sys.exit(1)
 
     report: Dict[str, dict] = {}
 
@@ -791,7 +791,7 @@ def run_pipeline(
         logger.info("=" * 60)
 
         try:
-            # Argumentos específicos por scraper
+            # 1. Scraping
             if key == "osinergmin":
                 data = cfg["fn"](max_pages=max_pages)
             elif key == "minem":
@@ -799,27 +799,27 @@ def run_pipeline(
             else:
                 data = cfg["fn"]()
 
-            outdir = OUTDIRS[cfg["key"]]
-            outdir.mkdir(parents=True, exist_ok=True)
-            filename = today_filename(cfg["name"])
-            outpath  = outdir / filename
-            save_json(data, outpath)
+            # 2. Upsert a BD — retorna solo los realmente nuevos
+            new_records = _db.upsert_records(data)
 
-            logger.info("✓ %s: %d registros → %s", cfg["name"], len(data), outpath)
+            # 3. Post-proceso Energiminas: resumir nuevos con OpenAI
+            if key == "energiminas" and new_records:
+                _enm_summarize_new(new_records)
+
+            logger.info("✓ %s: %d scrapeados / %d nuevos en BD",
+                        cfg["name"], len(data), len(new_records))
             report[key] = {
-                "status": "ok",
-                "count":  len(data),
-                "path":   str(outpath),
-                "data":   data,
+                "status":  "ok",
+                "scraped": len(data),
+                "new":     len(new_records),
             }
         except Exception as e:
             logger.error("✗ %s: ERROR — %s", cfg.get("name", key), e, exc_info=True)
             report[key] = {
-                "status": "error",
-                "error":  str(e),
-                "count":  0,
-                "path":   "",
-                "data":   [],
+                "status":  "error",
+                "error":   str(e),
+                "scraped": 0,
+                "new":     0,
             }
 
     # Resumen final
@@ -827,7 +827,7 @@ def run_pipeline(
     logger.info("PIPELINE COMPLETADO")
     for key, r in report.items():
         if r["status"] == "ok":
-            logger.info("  %-15s OK   — %d registros", key, r["count"])
+            logger.info("  %-15s OK   — %d scrapeados / %d nuevos", key, r["scraped"], r["new"])
         else:
             logger.info("  %-15s ERROR — %s", key, r.get("error", ""))
     logger.info("=" * 60)
@@ -835,11 +835,10 @@ def run_pipeline(
     # Guardar resumen en logs
     summary_path = LOGS_DIR / today_filename("pipeline_summary")
     try:
-        summary_export = {
-            k: {kk: vv for kk, vv in v.items() if kk != "data"}
-            for k, v in report.items()
-        }
-        save_json([summary_export], summary_path)
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     except Exception as e:
         logger.warning("No se pudo guardar resumen: %s", e)
 

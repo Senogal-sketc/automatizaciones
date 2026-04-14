@@ -1,30 +1,25 @@
 """
 email_report.py — Genera y envía el reporte diario de normas/noticias por Gmail.
 
-Uso:
-  # Después de correr pipeline.py:
-  python email_report.py
-
-  # O importando directamente desde otro script:
-  from email_report import build_and_send
+Lee los registros NUEVOS del día directamente desde Supabase (tabla normas_noticias,
+fecha_scraping = hoy). Solo envía si hay registros nuevos.
 
 Variables de entorno:
-  BASE_DATA_DIR         — Directorio raíz donde pipeline.py guardó los JSONs
-  GMAIL_CREDENTIALS     — Path a credentials.json  (default: credentials.json)
-  GMAIL_TOKEN           — Path a token.json         (default: token.json)
-  DESTINATARIOS         — Emails separados por coma (sobreescribe la lista interna)
+  SUPABASE_DB_URL   — Cadena de conexión PostgreSQL de Supabase (requerida)
+  GMAIL_CREDENTIALS — Path a credentials.json  (default: credentials.json)
+  GMAIL_TOKEN       — Path a token.json         (default: token.json)
+  DESTINATARIOS     — Emails separados por coma (sobreescribe la lista interna)
 """
 
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import os
 from datetime import datetime
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -33,13 +28,14 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+import db as _db
+
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────
 
 TZ = ZoneInfo("America/Lima")
 
-# Destinatarios por defecto (sobreescribibles con la env var DESTINATARIOS)
 _DEFAULT_DESTINATARIOS = [
     "egaray@grupomacro.pe",
     "evander.garay@gmail.com",
@@ -49,105 +45,21 @@ _DEFAULT_DESTINATARIOS = [
     "vflores@grupomacro.pe",
 ]
 
-GMAIL_SCOPES      = ["https://www.googleapis.com/auth/gmail.send"]
-CREDENTIALS_FILE  = Path(os.getenv("GMAIL_CREDENTIALS", "credentials.json"))
-TOKEN_FILE        = Path(os.getenv("GMAIL_TOKEN",        "token.json"))
-
-# Directorio raíz de datos (mismo que usa pipeline.py)
-_DEFAULT_BASE = (
-    r"C:\Users\egaray\Macroconsult S.A\Soporte TI - REGCOM"
-    r"\0_DATA\0.1_ELECTRICIDAD\0_BASES DE DATOS\Normas"
-)
-BASE_DATA_DIR = Path(os.getenv("BASE_DATA_DIR", _DEFAULT_BASE))
-
-OUTDIRS = {
-    "osinergmin": BASE_DATA_DIR / "Osinergmin_gob",
-    "el_peruano": BASE_DATA_DIR / "El Peruano",
-    "energiminas": BASE_DATA_DIR / "Energiminas",
-    "minem":       BASE_DATA_DIR / "MINEM",
-}
-
-# Nombre del remitente que aparece al pie del correo
-FIRMA = "Evander Garay"
+GMAIL_SCOPES     = ["https://www.googleapis.com/auth/gmail.send"]
+CREDENTIALS_FILE = Path(os.getenv("GMAIL_CREDENTIALS", "credentials.json"))
+TOKEN_FILE       = Path(os.getenv("GMAIL_TOKEN",        "token.json"))
+FIRMA            = "Evander Garay"
 
 log = logging.getLogger("email_report")
-
-# Archivo donde se guardan los links ya enviados
-SENT_STATE_FILE = Path(__file__).parent / "sent_state.json"
-
-# ─────────────────────────────────────────────
-# ESTADO DE REGISTROS YA ENVIADOS
-# ─────────────────────────────────────────────
-
-def _load_sent_state() -> Dict[str, Set[str]]:
-    """Carga el conjunto de links ya enviados por fuente."""
-    if not SENT_STATE_FILE.exists():
-        return {k: set() for k in OUTDIRS}
-    try:
-        raw = json.loads(SENT_STATE_FILE.read_text(encoding="utf-8"))
-        return {k: set(v) for k, v in raw.items()}
-    except Exception as e:
-        log.warning("No se pudo leer sent_state.json, se asume vacío: %s", e)
-        return {k: set() for k in OUTDIRS}
-
-
-def _save_sent_state(state: Dict[str, Set[str]]) -> None:
-    """Persiste el estado (sets → listas para JSON)."""
-    SENT_STATE_FILE.write_text(
-        json.dumps({k: sorted(v) for k, v in state.items()},
-                   ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    log.info("Estado de enviados guardado en %s", SENT_STATE_FILE)
-
-
-def _record_key(row: pd.Series, source: str) -> str:
-    """
-    Devuelve la clave única de un registro.
-    Usa 'link' si existe; si no, combina fuente + 'res' o 'titular'.
-    """
-    link = str(row.get("link", "")).strip()
-    if link and link not in ("nan", "None", ""):
-        return link
-    # Fallback para registros sin URL
-    for field in ("res", "titular", "sumilla"):
-        val = str(row.get(field, "")).strip()
-        if val and val not in ("nan", "None", ""):
-            return f"{source}::{val}"
-    return ""
-
-
-def _filter_new(df: pd.DataFrame, source: str, sent: Set[str]) -> pd.DataFrame:
-    """Retorna solo las filas cuya clave no está en 'sent'."""
-    if df.empty:
-        return df
-    mask = df.apply(lambda row: _record_key(row, source) not in sent, axis=1)
-    return df[mask].reset_index(drop=True)
-
-
-def _collect_keys(df: pd.DataFrame, source: str) -> Set[str]:
-    """Extrae todas las claves únicas de un DataFrame."""
-    if df.empty:
-        return set()
-    keys = df.apply(lambda row: _record_key(row, source), axis=1)
-    return {k for k in keys if k}
-
 
 # ─────────────────────────────────────────────
 # GMAIL AUTH
 # ─────────────────────────────────────────────
 
 def gmail_service():
-    """
-    Autentica con Gmail API.
-    - En producción/CI: lee token.json (refresh automático sin UI).
-    - Primera vez local: abre el navegador para autorizar.
-    """
     creds: Optional[Credentials] = None
-
     if TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), GMAIL_SCOPES)
-
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             log.info("Refrescando token de Gmail…")
@@ -156,19 +68,15 @@ def gmail_service():
             if not CREDENTIALS_FILE.exists():
                 raise FileNotFoundError(
                     f"No se encontró {CREDENTIALS_FILE}. "
-                    "Descárgalo desde Google Cloud Console y colócalo junto a este script, "
-                    "o define la variable de entorno GMAIL_CREDENTIALS."
+                    "Colócalo junto a este script o define GMAIL_CREDENTIALS."
                 )
             log.info("Iniciando flujo OAuth (solo necesario la primera vez)…")
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(CREDENTIALS_FILE), GMAIL_SCOPES
             )
             creds = flow.run_local_server(port=0)
-
-        # Guardar token para futuras ejecuciones
         TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
         log.info("Token guardado en %s", TOKEN_FILE)
-
     return build("gmail", "v1", credentials=creds)
 
 
@@ -182,51 +90,7 @@ def _send_html(service, to: str, subject: str, html: str) -> None:
 
 
 # ─────────────────────────────────────────────
-# LECTURA DE DATOS
-# ─────────────────────────────────────────────
-
-def _load_today_json(source: str, date_str: str) -> pd.DataFrame:
-    """
-    Busca el JSON de hoy (YYYY_MM_DD_<Name>.json) en el directorio correspondiente.
-    Retorna DataFrame vacío si no existe.
-    """
-    names = {
-        "osinergmin": "Osinergmin_gob",
-        "el_peruano": "EL_Peruano",
-        "energiminas": "Energiminas",
-        "minem": "MINEM",
-    }
-    outdir  = OUTDIRS[source]
-    pattern = f"{date_str}_{names[source]}*.json"
-    files   = sorted(outdir.glob(pattern))
-
-    if not files:
-        log.warning("No se encontró JSON de hoy para '%s' en %s (patrón: %s)",
-                    source, outdir, pattern)
-        return pd.DataFrame()
-
-    records = []
-    for fp in files:
-        try:
-            data = json.loads(fp.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                records.extend(data)
-            elif isinstance(data, dict):
-                records.append(data)
-        except Exception as e:
-            log.warning("Error leyendo %s: %s", fp.name, e)
-
-    return pd.DataFrame(records) if records else pd.DataFrame()
-
-
-def _to_bin(x) -> int:
-    if pd.isna(x):
-        return 0
-    return 1 if str(x).strip().lower() in ("1", "true", "t", "yes", "y") else 0
-
-
-# ─────────────────────────────────────────────
-# CONSTRUCCIÓN HTML
+# HELPERS HTML
 # ─────────────────────────────────────────────
 
 _CSS = """
@@ -246,32 +110,30 @@ _CSS = """
 """
 
 
-def _link(url: str, texto: str = "ver") -> str:
-    u = str(url).strip()
-    if not u:
-        return ""
-    return f'<a href="{u}" target="_blank" rel="noopener">{texto}</a>'
+def _to_bin(x) -> int:
+    if pd.isna(x):
+        return 0
+    return 1 if str(x).strip().lower() in ("1", "true", "t", "yes", "y") else 0
+
+
+def _link_html(url: str, texto: str = "ver") -> str:
+    u = str(url or "").strip()
+    return f'<a href="{u}" target="_blank" rel="noopener">{texto}</a>' if u else ""
 
 
 def _resumen_html(val) -> str:
-    """Convierte lista de ideas o string a HTML."""
     if isinstance(val, list) and val:
-        items = "".join(f"<li>{item}</li>" for item in val if item)
-        return f"<ul>{items}</ul>"
-    if isinstance(val, str) and val.strip():
-        return val
-    return ""
+        return "<ul>" + "".join(f"<li>{item}</li>" for item in val if item) + "</ul>"
+    return str(val) if val else ""
 
 
 def _df_to_table(df: pd.DataFrame, cols: list, link_col: str = "link") -> str:
     if df.empty:
-        return '<p class="empty">Sin registros en esta categoría.</p>'
-
+        return '<p class="empty">Sin registros.</p>'
     d = df.copy()
     for c in cols:
         if c not in d.columns:
             d[c] = ""
-
     headers = "".join(f"<th>{c}</th>" for c in cols)
     rows = []
     for _, row in d.iterrows():
@@ -279,122 +141,95 @@ def _df_to_table(df: pd.DataFrame, cols: list, link_col: str = "link") -> str:
         for c in cols:
             val = row.get(c, "")
             if c == link_col:
-                cell = _link(val)
+                cell = _link_html(val)
             elif c == "resumen":
                 cell = _resumen_html(val)
             else:
                 cell = str(val) if not pd.isna(val) else ""
             cells.append(f"<td>{cell}</td>")
         rows.append(f"<tr>{''.join(cells)}</tr>")
-
     return f"<table><tr>{headers}</tr>{''.join(rows)}</table>"
 
 
+# ─────────────────────────────────────────────
+# SECCIONES DEL CORREO
+# ─────────────────────────────────────────────
+
 def _section_el_peruano(df: pd.DataFrame, fecha_hoy: str) -> str:
     if df.empty:
-        return f"""
-        <h2>El Peruano</h2>
-        <p class="empty">No se encontraron datos para el {fecha_hoy}.</p>
-        """
+        return f'<h2>El Peruano</h2><p class="empty">Sin normas nuevas para {fecha_hoy}.</p>'
 
     df = df.copy()
     df["relevante_bin"] = df.get("relevante", pd.Series(0, index=df.index)).apply(_to_bin)
     df["impacto_bin"]   = df.get("impacto",   pd.Series(0, index=df.index)).apply(_to_bin)
-
     relev = df[df["relevante_bin"] == 1]
     imp1  = relev[relev["impacto_bin"] == 1]
     imp0  = relev[relev["impacto_bin"] == 0]
     cols  = ["res", "sumilla", "link"]
 
     if relev.empty:
-        return f"""
-        <h2>El Peruano</h2>
-        <p class="empty">No se encontraron normas relevantes para el {fecha_hoy}.</p>
-        """
-
-    n_total   = len(df)
-    n_relev   = len(relev)
-    n_impacto = len(imp1)
+        return (f'<h2>El Peruano</h2>'
+                f'<p>Total nuevas: <b>{len(df)}</b> — ninguna relevante para el sector eléctrico.</p>')
 
     return f"""
     <h2>El Peruano</h2>
-    <p>Total normas publicadas: <b>{n_total}</b> &nbsp;|&nbsp;
-       Relevantes: <b>{n_relev}</b> &nbsp;|&nbsp;
-       Con impacto eléctrico: <b>{n_impacto}</b></p>
-
-    <h3>Normas con impacto eléctrico</h3>
+    <p>Normas nuevas: <b>{len(df)}</b> &nbsp;|&nbsp;
+       Relevantes: <b>{len(relev)}</b> &nbsp;|&nbsp;
+       Con impacto eléctrico: <b>{len(imp1)}</b></p>
+    <h3>Con impacto eléctrico</h3>
     {_df_to_table(imp1, cols)}
-
-    <h3>Otras normas relevantes</h3>
+    <h3>Otras relevantes</h3>
     {_df_to_table(imp0, cols)}
     """
 
 
 def _section_energiminas(df: pd.DataFrame, fecha_hoy: str) -> str:
     if df.empty:
-        return f"""
-        <h2>Energiminas</h2>
-        <p class="empty">No se encontraron datos para el {fecha_hoy}.</p>
-        """
+        return f'<h2>Energiminas</h2><p class="empty">Sin noticias nuevas para {fecha_hoy}.</p>'
 
     df = df.copy()
-    df["nueva_bin"]    = df.get("nueva_noticia", pd.Series(0, index=df.index)).apply(_to_bin)
     df["relevante_bin"] = df.get("relevante", pd.Series(1, index=df.index)).apply(_to_bin)
-
-    nuevas = df[(df["nueva_bin"] == 1) & (df["relevante_bin"] == 1)]
+    nuevas = df[df["relevante_bin"] == 1]
     cols   = ["titular", "resumen", "link"]
 
     if nuevas.empty:
-        return f"""
-        <h2>Energiminas</h2>
-        <p class="empty">No hay noticias nuevas relevantes para el {fecha_hoy}.</p>
-        """
+        return (f'<h2>Energiminas</h2>'
+                f'<p>Noticias nuevas: <b>{len(df)}</b> — ninguna relevante para el sector eléctrico.</p>')
 
     return f"""
     <h2>Energiminas</h2>
-    <p>Noticias nuevas del sector eléctrico: <b>{len(nuevas)}</b></p>
+    <p>Noticias nuevas relevantes: <b>{len(nuevas)}</b></p>
     {_df_to_table(nuevas, cols)}
     """
 
 
 def _section_osinergmin(df: pd.DataFrame, fecha_hoy: str) -> str:
     if df.empty:
-        return f"""
-        <h2>Osinergmin — Normas Legales</h2>
-        <p class="empty">No se encontraron datos para el {fecha_hoy}.</p>
-        """
-
+        return f'<h2>Osinergmin</h2><p class="empty">Sin normas nuevas para {fecha_hoy}.</p>'
     cols = ["res", "fecha_pub", "sumilla", "link"]
     return f"""
     <h2>Osinergmin — Normas Legales</h2>
-    <p>Registros extraídos: <b>{len(df)}</b></p>
+    <p>Normas nuevas: <b>{len(df)}</b></p>
     {_df_to_table(df, cols)}
     """
 
 
 def _section_minem(df: pd.DataFrame, fecha_hoy: str) -> str:
     if df.empty:
-        return f"""
-        <h2>MINEM — Normas y Documentos</h2>
-        <p class="empty">No se encontraron datos para el {fecha_hoy}.</p>
-        """
-
+        return f'<h2>MINEM</h2><p class="empty">Sin normas nuevas para {fecha_hoy}.</p>'
     df = df.copy()
     df["relevante_bin"] = df.get("relevante", pd.Series(0, index=df.index)).apply(_to_bin)
     relev = df[df["relevante_bin"] == 1]
     resto = df[df["relevante_bin"] == 0]
     cols  = ["res", "fecha_pub", "sumilla", "link"]
-
-    partes = [f"<h2>MINEM — Normas y Documentos</h2>"]
-    partes.append(
-        f"<p>Total registros: <b>{len(df)}</b> &nbsp;|&nbsp; Relevantes: <b>{len(relev)}</b></p>"
-    )
+    partes = [
+        f"<h2>MINEM — Normas y Documentos</h2>",
+        f"<p>Total nuevas: <b>{len(df)}</b> &nbsp;|&nbsp; Relevantes: <b>{len(relev)}</b></p>",
+    ]
     if not relev.empty:
-        partes.append("<h3>Normas relevantes (sector eléctrico)</h3>")
-        partes.append(_df_to_table(relev, cols))
+        partes += ["<h3>Relevantes (sector eléctrico)</h3>", _df_to_table(relev, cols)]
     if not resto.empty:
-        partes.append("<h3>Otras normas</h3>")
-        partes.append(_df_to_table(resto, cols))
+        partes += ["<h3>Otras normas</h3>", _df_to_table(resto, cols)]
     return "\n".join(partes)
 
 
@@ -405,77 +240,79 @@ def build_html(
     df_minem: pd.DataFrame,
     fecha_hoy: str,
 ) -> str:
-    return f"""
-    <!DOCTYPE html>
-    <html lang="es">
-    <head><meta charset="utf-8">{_CSS}</head>
-    <body>
-    <p>Hola,</p>
-    <p>A continuación el <b>resumen diario de normas y noticias</b> del sector eléctrico
-       para el <b>{fecha_hoy}</b>:</p>
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="utf-8">{_CSS}</head>
+<body>
+<p>Hola,</p>
+<p>Resumen de <b>normas y noticias nuevas</b> del sector eléctrico para el <b>{fecha_hoy}</b>:</p>
 
-    {_section_el_peruano(df_elp, fecha_hoy)}
-    <hr>
-    {_section_energiminas(df_enm, fecha_hoy)}
-    <hr>
-    {_section_osinergmin(df_osn, fecha_hoy)}
-    <hr>
-    {_section_minem(df_minem, fecha_hoy)}
+{_section_el_peruano(df_elp, fecha_hoy)}
+<hr>
+{_section_energiminas(df_enm, fecha_hoy)}
+<hr>
+{_section_osinergmin(df_osn, fecha_hoy)}
+<hr>
+{_section_minem(df_minem, fecha_hoy)}
 
-    <p>Saludos,<br><b>{FIRMA}</b></p>
-    </body>
-    </html>
-    """
+<p>Saludos,<br><b>{FIRMA}</b></p>
+</body>
+</html>"""
 
 
 # ─────────────────────────────────────────────
 # PUNTO DE ENTRADA PRINCIPAL
 # ─────────────────────────────────────────────
 
+FUENTE_NAMES = {
+    "Osinergmin_gob":        "osinergmin",
+    "El Peruano":            "el_peruano",
+    "Revista Energiminas":   "energiminas",
+    "MINEM-Normas y Documentos": "minem",
+}
+
+
+def _to_df(records: list) -> pd.DataFrame:
+    return pd.DataFrame(records) if records else pd.DataFrame()
+
+
 def build_and_send(destinatarios: Optional[List[str]] = None) -> None:
     now         = datetime.now(TZ)
-    date_file   = now.strftime("%Y_%m_%d")   # para glob: 2026_04_06
-    date_hoy    = now.strftime("%d/%m/%Y")   # para el cuerpo: 06/04/2026
-    date_asunto = now.strftime("%Y-%m-%d")   # para el asunto: 2026-04-06
+    date_hoy    = now.strftime("%d/%m/%Y")
+    date_asunto = now.strftime("%Y-%m-%d")
 
-    log.info("Cargando JSONs de hoy (%s)…", date_file)
-    df_elp   = _load_today_json("el_peruano",  date_file)
-    df_enm   = _load_today_json("energiminas", date_file)
-    df_osn   = _load_today_json("osinergmin",  date_file)
-    df_minem = _load_today_json("minem",       date_file)
+    # Leer registros nuevos de hoy desde Supabase
+    log.info("Consultando registros nuevos de hoy en Supabase…")
+    all_new = _db.get_new_today()
+
+    if not all_new:
+        log.info("No hay registros nuevos hoy. No se enviará correo.")
+        return
+
+    log.info("Total registros nuevos hoy: %d", len(all_new))
+
+    # Separar por fuente
+    def _filter(fuente_val: str) -> pd.DataFrame:
+        return _to_df([r for r in all_new if r.get("fuente") == fuente_val])
+
+    df_elp   = _filter("El Peruano")
+    df_enm   = _filter("Revista Energiminas")
+    df_osn   = _filter("Osinergmin_gob")
+    df_minem = _filter("MINEM-Normas y Documentos")
 
     log.info(
-        "Registros cargados — El Peruano: %d | Energiminas: %d | Osinergmin: %d | MINEM: %d",
+        "El Peruano: %d | Energiminas: %d | Osinergmin: %d | MINEM: %d",
         len(df_elp), len(df_enm), len(df_osn), len(df_minem),
     )
 
-    # ── Filtrar solo registros nuevos (no enviados antes) ──
-    sent = _load_sent_state()
-
-    df_elp_new   = _filter_new(df_elp,   "el_peruano",  sent.get("el_peruano",  set()))
-    df_enm_new   = _filter_new(df_enm,   "energiminas", sent.get("energiminas", set()))
-    df_osn_new   = _filter_new(df_osn,   "osinergmin",  sent.get("osinergmin",  set()))
-    df_minem_new = _filter_new(df_minem, "minem",        sent.get("minem",       set()))
-
-    nuevos_total = len(df_elp_new) + len(df_enm_new) + len(df_osn_new) + len(df_minem_new)
-    log.info(
-        "Registros NUEVOS — El Peruano: %d | Energiminas: %d | Osinergmin: %d | MINEM: %d",
-        len(df_elp_new), len(df_enm_new), len(df_osn_new), len(df_minem_new),
-    )
-
-    if nuevos_total == 0:
-        log.info("Sin registros nuevos. No se enviará correo.")
-        return
-
-    html   = build_html(df_elp_new, df_enm_new, df_osn_new, df_minem_new, date_hoy)
+    html   = build_html(df_elp, df_enm, df_osn, df_minem, date_hoy)
     asunto = f"{date_asunto} | Resumen diario — Normas y Noticias Eléctricas"
 
     if destinatarios is None:
         env_dest = os.getenv("DESTINATARIOS", "")
         destinatarios = (
             [e.strip() for e in env_dest.split(",") if e.strip()]
-            if env_dest
-            else _DEFAULT_DESTINATARIOS
+            if env_dest else _DEFAULT_DESTINATARIOS
         )
 
     log.info("Autenticando Gmail…")
@@ -484,13 +321,6 @@ def build_and_send(destinatarios: Optional[List[str]] = None) -> None:
         _send_html(service, correo, asunto, html)
 
     log.info("✓ Reporte enviado a %d destinatario(s).", len(destinatarios))
-
-    # ── Actualizar estado con los registros recién enviados ──
-    sent.setdefault("el_peruano",  set()).update(_collect_keys(df_elp_new,   "el_peruano"))
-    sent.setdefault("energiminas", set()).update(_collect_keys(df_enm_new,   "energiminas"))
-    sent.setdefault("osinergmin",  set()).update(_collect_keys(df_osn_new,   "osinergmin"))
-    sent.setdefault("minem",       set()).update(_collect_keys(df_minem_new, "minem"))
-    _save_sent_state(sent)
 
 
 if __name__ == "__main__":
