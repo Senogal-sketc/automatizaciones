@@ -137,7 +137,7 @@ def _to_row(record: dict) -> Optional[dict]:
 # ─────────────────────────────────────────────
 
 _INSERT_SQL = """
-INSERT INTO normas_noticias
+INSERT INTO normas_noticias.normas_noticias
     (fuente, link, res, titular, fecha_pub, sumilla, contenido, relevante, impacto, resumen)
 VALUES
     (%(fuente)s, %(link)s, %(res)s, %(titular)s, %(fecha_pub)s,
@@ -185,7 +185,7 @@ def upsert_records(records: List[dict]) -> List[dict]:
 def update_summary(link: str, resumen: list, relevante: str) -> None:
     """Actualiza resumen y relevante de un registro ya insertado (para Energiminas + OpenAI)."""
     sql = """
-    UPDATE normas_noticias
+    UPDATE normas_noticias.normas_noticias
     SET resumen   = %s,
         relevante = %s
     WHERE link = %s;
@@ -209,7 +209,7 @@ def get_new_today(fuente: Optional[str] = None) -> List[dict]:
     sql = """
     SELECT fuente, link, res, titular, fecha_pub, sumilla,
            contenido, relevante, impacto, resumen, created_at
-    FROM   normas_noticias
+    FROM   normas_noticias.normas_noticias
     WHERE  fecha_scraping = CURRENT_DATE
     """
     params: list = []
@@ -244,7 +244,7 @@ def links_in_db(links: List[str]) -> Set[str]:
     """Retorna el subconjunto de links que ya existen en la BD."""
     if not links:
         return set()
-    sql = "SELECT link FROM normas_noticias WHERE link = ANY(%s);"
+    sql = "SELECT link FROM normas_noticias.normas_noticias WHERE link = ANY(%s);"
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (links,))
